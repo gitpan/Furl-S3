@@ -1,7 +1,7 @@
 ---
 abstract: 'Furl based S3 client library.'
 author:
-  - 'Tomohiro Ikebe <ikebe {at} livedoor.jp>'
+  - 'Tomohiro Ikebe <ikebe {at} shebang.jp>'
 build_requires:
   ExtUtils::MakeMaker: 6.42
 configure_requires:
@@ -22,7 +22,7 @@ requires:
   Class::Accessor::Lite: 0
   Digest::HMAC_SHA1: 0
   File::Type: 0
-  Furl: 0.18
+  Furl: 0.38
   HTTP::Date: 0
   MIME::Base64: 0
   Params::Validate: 0
@@ -31,4 +31,4 @@ requires:
   XML::LibXML::XPathContext: 0
 resources:
   license: http://dev.perl.org/licenses/
-version: 0.01
+version: 0.02

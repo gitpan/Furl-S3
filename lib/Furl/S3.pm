@@ -3,7 +3,7 @@ package Furl::S3;
 use strict;
 use warnings;
 use Class::Accessor::Lite;
-use Furl;
+use Furl::HTTP qw(HEADERS_AS_HASHREF);
 use Digest::HMAC_SHA1;
 use MIME::Base64 qw(encode_base64);
 use HTTP::Date;
@@ -12,12 +12,12 @@ use XML::LibXML;
 use XML::LibXML::XPathContext;
 use Furl::S3::Error;
 use Params::Validate qw(:types validate_with validate_pos);
-use URI::Escape qw(uri_escape);
+use URI::Escape qw(uri_escape_utf8);
 use Carp ();
 
 Class::Accessor::Lite->mk_accessors(qw(aws_access_key_id aws_secret_access_key secure furl endpoint));
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 our $DEFAULT_ENDPOINT = 's3.amazonaws.com';
 our $XMLNS = 'http://s3.amazonaws.com/doc/2006-03-01/';
 
@@ -37,9 +37,10 @@ sub new {
     Carp::croak("aws_access_key_id and aws_secret_access_key are mandatory") unless $aws_access_key_id && $aws_secret_access_key;
     my $secure = delete $args{secure} || '0';
     my $endpoint = delete $args{endpoint} || $DEFAULT_ENDPOINT;
-    my $furl = Furl->new( 
+    my $furl = Furl::HTTP->new( 
         agent => '$class/'. $VERSION,
         %args,
+        header_format => HEADERS_AS_HASHREF,
     );
     my $self = bless {
         endpoint => $endpoint,
@@ -139,6 +140,7 @@ sub resource {
     my $resource = $bucket;
     $resource = '/'. $resource unless $resource =~ m{^/};
     if ( defined $key ) {
+        $key = _normalize_key($key);
         $resource = join '/', $resource, $key;
     }
     if ( $subresource ) {
@@ -152,7 +154,7 @@ sub _path_query {
     my( $self, $path, $q ) = @_;
     $path = '/'. $path unless $path =~ m{^/};
     my $qs = ref($q) eq 'HASH' ? 
-        join('&', map { $_. '='. uri_escape( $q->{$_} ) } keys %{$q}) : $q;
+        join('&', map { $_. '='. uri_escape_utf8( $q->{$_} ) } keys %{$q}) : $q;
     $path .= '?'. $qs if $qs;
     $path;
 }
@@ -160,6 +162,7 @@ sub _path_query {
 sub host_and_path_query {
     my( $self, $bucket, $key, $params ) = @_;
     my($host, $path_query);
+    $key = _normalize_key($key);
     if ( is_dns_style($bucket) ) {
         $host = join '.', $bucket, $self->endpoint;
         $path_query = $self->_path_query( $key, $params );
@@ -203,8 +206,9 @@ sub request {
 
     my( $host, $path_query ) = 
         $self->host_and_path_query( $bucket, $key, $params );
+    my %res;
     my @h = %h;
-    $self->furl->request(
+    @res{qw(ver code msg headers body)} = $self->furl->request(
         method => $method,
         scheme => ($self->secure ? 'https' : 'http'),
         host => $host,
@@ -212,6 +216,7 @@ sub request {
         headers => \@h,
         %{$furl_options},
     );
+    return \%res;
 }
 
 sub signed_url {
@@ -244,10 +249,10 @@ sub _create_xpc {
 sub list_buckets {
     my $self = shift;
     my $res = $self->request( 'GET', '/' );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ));
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
-    my $xpc = $self->_create_xpc( $res->content );
+    my $xpc = $self->_create_xpc( $res->{body} );
     my @buckets;
     for my $node($xpc->findnodes('/s3:ListAllMyBucketsResult/s3:Buckets/s3:Bucket')) {
         my $name = $xpc->findvalue('./s3:Name', $node);
@@ -275,10 +280,10 @@ sub create_bucket {
                   { type => HASHREF, optional => 1, } );
 
     my $res = $self->request( 'PUT', $bucket, undef, undef, $headers );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ) );
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
-    return $res->is_success;
+    return 1;
 }
 
 sub delete_bucket {
@@ -286,10 +291,10 @@ sub delete_bucket {
     my( $bucket ) = @_;
     validate_pos( @_, 1 );
     my $res = $self->request( 'DELETE', $bucket );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ) );
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
-    return $res->is_success;
+    return 1;
 }
 
 sub list_objects {
@@ -297,10 +302,10 @@ sub list_objects {
     my( $bucket, $params ) = @_;
     validate_pos( @_, 1, { type => HASHREF, optional => 1 });
     my $res = $self->request( 'GET', $bucket, undef, $params );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ));
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
-    my $xpc = $self->_create_xpc( $res->content );
+    my $xpc = $self->_create_xpc( $res->{body} );
     my @contents;
     for my $node($xpc->findnodes('/s3:ListBucketResult/s3:Contents')) {
         push @contents, +{
@@ -339,10 +344,10 @@ sub create_object {
                   { type => HANDLE | SCALAR }, 
                   { type => HASHREF, optional => 1 } );
     my $res = $self->request( 'PUT', $bucket, $key, undef, $headers, +{ content => $content });
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ));
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
-    return $res->is_success;
+    return 1;
 }
 
 sub create_object_from_file {
@@ -369,23 +374,37 @@ sub create_object_from_file {
     $self->create_object( $bucket, $key, $fh, $headers )
 }
 
+sub copy_object {
+    my $self = shift;
+    my( $source_bucket, $source_key, $dest_bucket, $dest_key, $headers ) = @_;
+    validate_pos( @_, 
+                  1, 1, 1, 
+                  { type => SCALAR | UNDEF, optional => 1 },
+                  { type => HASHREF, optional => 1} );
+    $headers ||= +{};
+    my $source = $self->resource( $source_bucket, $source_key );
+    $self->create_object( $dest_bucket, $dest_key, '', {
+        %{$headers},
+        'x-amz-copy-source' => $source,
+    });
+}
+
 sub _normalize_response {
     my( $self, $res, $is_head ) = @_;
     my %res;
-    my $headers = $res->headers;
-    for my $key( $headers->keys ) {
-        my @val = $headers->header( $key );
-        $res{$key} = (@val > 1) ? \@val : $val[0];
+    while (my($k, $v) = each %{$res->{headers}}) {
+        $res{$k} = $v;
     }
     # remove etag's double quote.
-    if ( my $etag = $headers->header('etag') ) {
+    if ( my $etag = $res{'etag'} ) {
         $res{etag} = _remove_quote( $etag );
     }
-    $res{content_length} = $headers->content_length;
-    $res{content_type} = $headers->content_type;
-    $res{last_modified} = $headers->last_modified;
+    # make aliases
+    $res{content_length} = $res{'content-length'};
+    $res{content_type} = $res{'content-type'};
+    $res{last_modified} = $res{'last-modified'};
     unless ( $is_head ) {
-        $res{content} = $res->content;
+        $res{content} = $res->{body};
     }
     return \%res;
 }
@@ -398,8 +417,8 @@ sub get_object {
                   { type => HASHREF, optional => 1 },
                   { type => HASHREF, optional => 1 }, );
     my $res = $self->request( 'GET', $bucket, $key, undef, $headers, $furl_options );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ));
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
     $self->_normalize_response( $res );
 }
@@ -419,8 +438,8 @@ sub head_object {
     my( $bucket, $key, $headers ) = @_;
     validate_pos( @_, 1, 1, { type => HASHREF, optional => 1 } );
     my $res = $self->request( 'HEAD', $bucket, $key, undef, $headers );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ));
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
     $self->_normalize_response( $res, 1 );
 }
@@ -430,10 +449,10 @@ sub delete_object {
     my( $bucket, $key ) = @_;
     validate_pos( @_, 1, 1 );
     my $res = $self->request( 'DELETE', $bucket, $key );
-    unless ( $res->is_success ) {
-        return $self->error( Furl::S3::Error->new( $res, $res->content ));
+    unless ( _http_is_success($res->{code}) ) {
+        return $self->error( $res );
     }
-    return $res->is_success;
+    return 1;
 }
 
 sub clear_error {
@@ -443,13 +462,26 @@ sub clear_error {
 
 sub error {
     my $self = shift;
-    if ( $_[0] ) {
-        $self->{_error} = $_[0];
+    if ( @_ ) {
+        my $error = Furl::S3::Error->new( $_[0] );
+        $self->{_error} = $error;
         return ;
     }
     $self->{_error};
 }
 
+sub _normalize_key {
+    my $key = shift;
+    join '/', map { _uri_escape($_) } split /\//, $key;
+}
+
+sub _http_is_success {
+    $_[0] >= 200 && $_[0] < 300;
+}
+
+sub _uri_escape {
+    uri_escape_utf8($_[0], '^A-Za-z0-9\._-');
+}
 1;
 
 
@@ -675,9 +707,14 @@ returns a HASH-REF
 delete object.
 returns a boolean value.
 
+=head2 copy_object($source_bucket, $source_key, $dest_bucket, $dest_key, [ \%headers ]);
+
+copy object.
+return a boolean value.
+
 =head1 AUTHOR
 
-Tomohiro Ikebe E<lt>ikebe {at} livedoor.jpE<gt>
+Tomohiro Ikebe E<lt>ikebe {at} shebang.jpE<gt>
 
 =head1 SEE ALSO
 
